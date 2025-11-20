@@ -4,6 +4,10 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.apache.flink.api.common.eventtime.WatermarkStrategy;
 import org.apache.flink.api.common.functions.OpenContext;
 import org.apache.flink.api.common.serialization.DeserializationSchema;
+import org.apache.flink.api.common.serialization.SerializationSchema;
+import org.apache.flink.connector.base.DeliveryGuarantee;
+import org.apache.flink.connector.kafka.sink.KafkaRecordSerializationSchema;
+import org.apache.flink.connector.kafka.sink.KafkaSink;
 import org.apache.flink.api.common.state.ValueState;
 import org.apache.flink.api.common.state.ValueStateDescriptor;
 import org.apache.flink.api.common.typeinfo.TypeInformation;
@@ -28,11 +32,12 @@ public class TaskSchedulerJob {
         // Configuration from arguments or defaults
         String bootstrapServers = args.length > 0 ? args[0] : "localhost:9092";
         String inputTopic = args.length > 1 ? args[1] : "task-requests";
+        String outputTopic = args.length > 2 ? args[2] : "scheduled-tasks";
 
         log.info("Starting Task Scheduler Flink Job with Kafka {}", System.currentTimeMillis());
         log.info("Bootstrap Servers: {} {}", bootstrapServers, System.currentTimeMillis());
         log.info("Input Topic: {} {}", inputTopic, System.currentTimeMillis());
-        log.info("Mode: Consumer Only - No Outbound Publishing {}", System.currentTimeMillis());
+        log.info("Output Topic: {} {}", outputTopic, System.currentTimeMillis());
 
         // Set up the execution environment
         final StreamExecutionEnvironment env = StreamExecutionEnvironment.getExecutionEnvironment();
@@ -56,12 +61,27 @@ public class TaskSchedulerJob {
                 "Task Events Source"
         );
 
-        // Process tasks with scheduling logic (no outbound Kafka publishing)
-        tasks
+        // Process tasks with scheduling logic
+        DataStream<Task> scheduledTasks = tasks
                 .keyBy(task -> task.getId().toString())
                 .process(new TaskSchedulingFunction())
-                .name("Task Scheduler Function")
-                .print().name("Task Monitor"); // Only print for monitoring
+                .name("Task Scheduler Function");
+
+        // Set up Kafka sink for scheduled tasks (only from onTimer)
+        KafkaSink<Task> sink = KafkaSink.<Task>builder()
+                .setBootstrapServers(bootstrapServers)
+                .setRecordSerializer(KafkaRecordSerializationSchema.builder()
+                        .setTopic(outputTopic)
+                        .setValueSerializationSchema(new TaskSerializationSchema())
+                        .build())
+                .setDeliveryGuarantee(DeliveryGuarantee.AT_LEAST_ONCE)
+                .build();
+
+        // Send scheduled tasks to Kafka (only when timer fires)
+        scheduledTasks.sinkTo(sink).name("Scheduled Tasks Sink");
+
+        // Also print for monitoring
+        scheduledTasks.print().name("Task Monitor");
 
         // Execute the job
         env.execute("Task Scheduler Job - Kafka Integration");
@@ -132,14 +152,28 @@ public class TaskSchedulerJob {
                 log.info("[TIMER-PROCESSING] [{}] Processing timer for task: {} - creating execution task", 
                         System.currentTimeMillis(), ctx.getCurrentKey());
                 
-                log.info("[TIMER-EXECUTION] [{}] Timer executed for task: {} - TASK READY FOR EXECUTION (no outbound publishing)", 
-                        System.currentTimeMillis(), ctx.getCurrentKey());
+                // Create task for execution
+                Task task = new Task();
+                task.setId(java.util.UUID.fromString(ctx.getCurrentKey()));
+                task.setStatus("READY_FOR_EXECUTION");
+                task.setUpdatedAt(Instant.ofEpochMilli(timestamp));
+                
+                long beforeTimerOutboundTimestamp = System.currentTimeMillis();
+                log.info("[TIMER-OUTBOUND-BEFORE] [{}] About to publish timer-triggered task: {} to scheduled-tasks topic with status: {}", 
+                        beforeTimerOutboundTimestamp, task.getId(), task.getStatus());
+                
+                // Emit task for execution (THIS IS WHERE WE PUBLISH)
+                out.collect(task);
+                
+                long afterTimerOutboundTimestamp = System.currentTimeMillis();
+                log.info("[TIMER-OUTBOUND-AFTER] [{}] Successfully published timer-triggered task: {} to scheduled-tasks topic (took {}ms)", 
+                        afterTimerOutboundTimestamp, task.getId(), (afterTimerOutboundTimestamp - beforeTimerOutboundTimestamp));
                 
                 // Clear state - no more recurring executions
                 nextExecutionTimeState.clear();
                 
-                log.info("[TIMER-COMPLETED] [{}] Task {} execution timer completed - no more timers scheduled", 
-                        System.currentTimeMillis(), ctx.getCurrentKey());
+                log.info("[TIMER-COMPLETED] [{}] Task {} execution completed - no more timers scheduled", 
+                        System.currentTimeMillis(), task.getId());
             } else {
                 log.warn("[TIMER-MISMATCH] [{}] Timer timestamp {} does not match expected {} for task: {}", 
                         System.currentTimeMillis(), timestamp, nextTime, ctx.getCurrentKey());
@@ -182,6 +216,34 @@ public class TaskSchedulerJob {
         @Override
         public TypeInformation<Task> getProducedType() {
             return TypeInformation.of(Task.class);
+        }
+    }
+
+    /**
+     * Task Serialization Schema
+     */
+    public static class TaskSerializationSchema implements SerializationSchema<Task> {
+        private transient ObjectMapper objectMapper;
+
+        @Override
+        public byte[] serialize(Task task) {
+            if (objectMapper == null) {
+                objectMapper = new ObjectMapper()
+                        .findAndRegisterModules()
+                        .configure(com.fasterxml.jackson.databind.DeserializationFeature.FAIL_ON_UNKNOWN_PROPERTIES, false);
+            }
+            
+            long serializeTimestamp = System.currentTimeMillis();
+            try {
+                byte[] serializedData = objectMapper.writeValueAsBytes(task);
+                log.info("[SERIALIZE] [{}] Successfully serialized task: {} to {} bytes for Kafka", 
+                        serializeTimestamp, task.getId(), serializedData.length);
+                return serializedData;
+            } catch (Exception e) {
+                log.error("[SERIALIZE-ERROR] [{}] Failed to serialize task: {} - {}", 
+                        serializeTimestamp, task.getId(), e.getMessage(), e);
+                return new byte[0];
+            }
         }
     }
 
